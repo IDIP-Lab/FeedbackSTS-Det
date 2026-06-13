@@ -33,17 +33,15 @@ We used IRSatVideo-LEO and NUDT-MIRSDT for training. The two datasets could be f
 
 For the NUDT-MIRSDT dataset, we have prepared a pre-processed version adapted to our code format. It can be downloaded in [Google Cloud](https://drive.google.com/file/d/1afTlcifxpYJJ1e2r9BJyooL0D3ImNBO7/view?usp=drive_link) or [Baidu Cloud]( https://pan.baidu.com/s/1ZH2hdVauW4Zy5_1noCbuKA?pwd=ggkp) with code of "ggkp".
 
-下载后，数据集构筑形式如下：
-
-
 ## Commands
 ### Commands for Training
 #### Single GPU Training
 * **Train on IRSatVideo-LEO dataset**
 ```bash
 python train.py \
-  --dataset_dir <Your own dataset directory> \
+  --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
   --dataset_names IRSatVideo-LEO \
+  --base-dir <PATH_TO_SAVE_PARAMETER_DIRECTORY> \
   --seq_len 5 \
   --sample_space 3 \
   --batchSize 6 \
@@ -52,8 +50,9 @@ python train.py \
 * **Train on NUDT-MIRSDT dataset**
 ```bash
 python train.py \
-  --dataset_dir <Your own dataset directory> \
+  --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
   --dataset_names NUDT-MIRSDT-NEW-v2 \
+  --base-dir <PATH_TO_SAVE_PARAMETER_DIRECTORY> \
   --seq_len 5 \
   --sample_space 1 \
   --batchSize 6 \
@@ -63,7 +62,7 @@ python train.py \
 When running on a server with multiple GPUs, you can specify a particular GPU device by adding the `--gpu <GPU_ID>` argument. For example, 
 ```bash
 python train.py \
-  --dataset_dir <Your own dataset directory> \
+  --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
   --dataset_names IRSatVideo-LEO \
   --seq_len 5 \
   --sample_space 3 \
@@ -72,13 +71,61 @@ python train.py \
   --gpu 2   # Use GPU 2
 ```
 #### Multiple GPU Training
+Multi-GPU training follows the same procedure as single-GPU training. Simply replace `train.py` with `train_multi.py` and specify multiple GPU IDs in the `--gpu` argument. The specific example is shown below:
+```bash
+python train_multi.py \
+  --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
+  --dataset_names IRSatVideo-LEO \
+  --base-dir <PATH_TO_SAVE_PARAMETER_DIRECTORY> \
+  --seq_len 13 \
+  --sample_space 3 \
+  --batchSize 16 \
+  --patchSize 256 \
+  --gpu 0,1,2,3,4,5 # Specify multiple GPUs
+```
 
 ### Commands for Testing
+**Note**: In the testing command below, the `dataset_names` and `seq_len` parameters must be consistent with those used during training.
+* **Test on IRSatVideo-LEO dataset**
+```bash
+python test.py \
+    --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
+    --dataset_names IRSatVideo-LEO \
+    --base_save_dir <PATH_TO_SAVE_RESULT_PIC_DIRECTORY> \
+    --pth_paths <PATH_TO_SAVE_PARAMETER_PATH> \
+    --seq_len 5 \
+    --patchSize 256
+```
+* **Test on NUDT-MIRSDT dataset**
+```bash
+python test.py \
+    --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
+    --dataset_names NUDT-MIRSDT-NEW-v2 \
+    --base_save_dir <PATH_TO_SAVE_RESULT_PIC_DIRECTORY> \
+    --pth_paths <PATH_TO_SAVE_PARAMETER_PATH> \
+    --seq_len 5 \
+    --patchSize 256
+```
 
 ### Commands for Evaluation
+* **Evaluate on IRSatVideo-LEO dataset**
+```bash
+python evaluate.py \
+    --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
+    --base_save_dir <PATH_TO_SAVE_EVALUATION_DIRECTORY> \
+    --base_size 1024 \
+    --rst_dirs <PATH_TO_SAVE_RESULT_PIC_DIRECTORY>
+```
+* **Evaluate on NUDT-MIRSDT dataset**
+```bash
+python evaluate.py \
+    --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
+    --base_save_dir <PATH_TO_SAVE_EVALUATION_DIRECTORY> \
+    --base_size 256 \
+    --rst_dirs <PATH_TO_SAVE_RESULT_PIC_DIRECTORY>
+```
 
-# Citation
-
+## Citation
 ```Citation
 @misc{huang2026feedbacksts,
       title={FeedbackSTS-Det: Sparse Frames-Based Spatio-Temporal Semantic Feedback Network for Moving Infrared Small Target Detection},
