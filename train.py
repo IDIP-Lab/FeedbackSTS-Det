@@ -112,15 +112,6 @@ class Trainer(object):
         self.max_iter = args.epochs * self.iter_per_epoch
 
         ## GPU
-        # gpu_list = names_standard_format(args.gpu)
-        # if torch.cuda.is_available():
-        #     if((len(gpu_list) > 1) and torch.cuda.device_count() > 1):
-        #         gpu_devices = ",".join(gpu_list)
-        #         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_devices
-        #     else:
-        #         torch.cuda.set_device(int(gpu_list[0]))
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         if torch.cuda.is_available():
             torch.cuda.set_device(int(args.gpu))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,8 +121,18 @@ class Trainer(object):
 
         self.net = self.net.to(self.device)
 
-        if self.args.precision == "16F":
-            self.net.half()
+        # ------------------------------------------------------------
+        # Half-precision initialization
+        # ------------------------------------------------------------
+        self.amp_enabled = (self.args.precision == "16F")
+        if self.amp_enabled:
+            # AMP scaler for gradient scaling (prevents underflow in half)
+            #self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler('cuda')
+            # Ensure the DCN2 CUDA extension is properly initialized for half
+            # (no need to call net.half() — AMP autocast handles it dynamically)
+        else:
+            self.scaler = None
 
         ## criterion
         self.cal_loss = SoftIoULoss()
@@ -152,7 +153,6 @@ class Trainer(object):
         self.logger.info(self.model_name + " + " + args.dataset_name)
 
     def training(self):
-        #epoch_state = 0
         total_loss_list = []
         total_loss_epoch = []
 
@@ -167,24 +167,34 @@ class Trainer(object):
                 img = img.to(self.device)
                 gt_mask = gt_mask.to(self.device)
 
-                if self.args.precision == "16F":
-                    img = img.half()
-                    gt_mask = gt_mask.half()
-
                 if img.shape[0] == 1: # batch size 为 1 又有什么影响?
                     continue
-                
-                pred = self.net(img)
 
-                if self.args.precision:
-                    pred = pred.float()
+                # ------------------------------------------------------------
+                # Forward pass with optional AMP autocast
+                # ------------------------------------------------------------
+                if self.amp_enabled:
+                    #with torch.cuda.amp.autocast(dtype=torch.float16):
+                    with torch.amp.autocast('cuda', dtype=torch.float16):
+                        pred = self.net(img)
+                        loss = self.cal_loss(pred, gt_mask)
+                else:
+                    pred = self.net(img)
+                    loss = self.cal_loss(pred, gt_mask)
 
-                loss = self.cal_loss(pred, gt_mask)
                 total_loss_epoch.append(loss.detach().cpu())
 
+                # ------------------------------------------------------------
+                # Backward pass with optional gradient scaling
+                # ------------------------------------------------------------
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                if self.amp_enabled:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
 
                 self.iter_num += 1
 
@@ -202,25 +212,19 @@ class Trainer(object):
 
             self.scheduler.step()
 
-            if (idx_epoch + 1) % self.args.log_per_epoch == 0: # 该代码没有任何过滤作用，只要是非负整数，就能触发
+            if (idx_epoch + 1) % self.args.log_per_epoch == 0:
                 total_loss_list.append(float(np.array(total_loss_epoch).mean()))
                 self.logger.info(time.ctime()[4:-5] + ' Epoch---%d, lr---%f, total_loss---%f' % (idx_epoch + 1, 
                                     self.optimizer.state_dict()['param_groups'][0]['lr'], total_loss_list[-1]))
                 total_loss_epoch = []
 
             if (idx_epoch + 1) % self.args.save_iter_step == 0:
-                # if (idx_epoch + 1) % 1 == 0:
                 save_pth = self.args.dataset_save_dir \
                     + self.model_name + '_' \
                     + "SeqLen{:02d}".format(self.args.seq_len) + '_' \
                     + "{:02d}".format(idx_epoch + 1) + '.pth.tar'
                 
                 torch.save(self.net.state_dict(), save_pth)
-                # save_checkpoint({
-                #     'epoch': idx_epoch + 1,
-                #     'state_dict': self.net.state_dict(),
-                #     'total_loss': total_loss_list,
-                #     }, save_pth)
                 
             if (idx_epoch + 1) == self.args.epochs and (idx_epoch + 1) % 5 != 0:
                 save_pth = self.args.dataset_save_dir \

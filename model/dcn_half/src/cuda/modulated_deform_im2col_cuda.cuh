@@ -20,64 +20,102 @@ inline int GET_BLOCKS(const int N)
   return (N + CUDA_NUM_THREADS - 1) / CUDA_NUM_THREADS;
 }
 
+// ---------------------------------------------------------------------------
+// Anti-aliased floor / abs for half/bf16 — cast to float internally
+// NOTE: All floating-point arithmetic inside kernels uses float internally.
+// Static casts on __half/__nv_bfloat16 are done via overloaded _to_float()
+// to avoid depending on C++ conversion operators (blocked by -D__CUDA_NO_HALF*).
+// ---------------------------------------------------------------------------
+template <typename T>
+__device__ __forceinline__ float _to_float(T x);
+
+template<> __device__ __forceinline__ float _to_float(float x) { return x; }
+template<> __device__ __forceinline__ float _to_float(double x) { return (float)x; }
+template<> __device__ __forceinline__ float _to_float(__half x) { return __half2float(x); }
+template<> __device__ __forceinline__ float _to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+template<> __device__ __forceinline__ float _to_float(c10::Half x) {
+  unsigned short us;
+  memcpy(&us, &x, sizeof(unsigned short));
+  __half h;
+  memcpy(&h, &us, sizeof(__half));
+  return __half2float(h);
+}
+template<> __device__ __forceinline__ float _to_float(c10::BFloat16 x) {
+  unsigned short us;
+  memcpy(&us, &x, sizeof(unsigned short));
+  __nv_bfloat16 h;
+  memcpy(&h, &us, sizeof(__nv_bfloat16));
+  return __bfloat162float(h);
+}
+
+__device__ __forceinline__ float _scalar_floor(float x) { return floorf(x); }
+__device__ __forceinline__ float _scalar_abs(float x)  { return fabsf(x); }
+__device__ __forceinline__ double _scalar_floor(double x) { return floor(x); }
+__device__ __forceinline__ double _scalar_abs(double x)  { return fabs(x); }
+__device__ __forceinline__ float _scalar_floor(__half x) { return floorf(__half2float(x)); }
+__device__ __forceinline__ float _scalar_abs(__half x)  { return fabsf(__half2float(x)); }
+__device__ __forceinline__ float _scalar_floor(__nv_bfloat16 x) { return floorf(__bfloat162float(x)); }
+__device__ __forceinline__ float _scalar_abs(__nv_bfloat16 x)  { return fabsf(__bfloat162float(x)); }
+
+// ---------------------------------------------------------------------------
+// Bilinear interpolation — works with float/double/half/bf16
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__device__ float _bilinear_fetch(const scalar_t *bottom_data, const int data_width,
+                                 int h, int w, int height, int width) {
+  if (h >= 0 && h < height && w >= 0 && w < width)
+    return _to_float(bottom_data[h * data_width + w]);
+  return 0.0f;
+}
 
 template <typename scalar_t>
-__device__ scalar_t mdmcn_im2col_bilinear(const scalar_t *bottom_data, const int data_width,
+__device__ scalar_t dmcn_im2col_bilinear(const scalar_t *bottom_data, const int data_width,
                                       const int height, const int width, scalar_t h, scalar_t w)
 {
-  int h_low = floor(h);
-  int w_low = floor(w);
+  float h_f = _to_float(h);
+  float w_f = _to_float(w);
+  int h_low = (int)floorf(h_f);
+  int w_low = (int)floorf(w_f);
   int h_high = h_low + 1;
   int w_high = w_low + 1;
 
-  scalar_t lh = h - h_low;
-  scalar_t lw = w - w_low;
-  scalar_t hh = 1 - lh, hw = 1 - lw;
+  float lh = h_f - h_low;
+  float lw = w_f - w_low;
+  float hhf = 1.0f - lh, hwf = 1.0f - lw;
 
-  scalar_t v1 = 0;
-  if (h_low >= 0 && w_low >= 0)
-    v1 = bottom_data[h_low * data_width + w_low];
-  scalar_t v2 = 0;
-  if (h_low >= 0 && w_high <= width - 1)
-    v2 = bottom_data[h_low * data_width + w_high];
-  scalar_t v3 = 0;
-  if (h_high <= height - 1 && w_low >= 0)
-    v3 = bottom_data[h_high * data_width + w_low];
-  scalar_t v4 = 0;
-  if (h_high <= height - 1 && w_high <= width - 1)
-    v4 = bottom_data[h_high * data_width + w_high];
+  float v1 = _bilinear_fetch(bottom_data, data_width, h_low, w_low, height, width);
+  float v2 = _bilinear_fetch(bottom_data, data_width, h_low, w_high, height, width);
+  float v3 = _bilinear_fetch(bottom_data, data_width, h_high, w_low, height, width);
+  float v4 = _bilinear_fetch(bottom_data, data_width, h_high, w_high, height, width);
 
-  scalar_t w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
-
-  scalar_t val = (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
-  return val;
+  float val = (hhf * hwf * v1 + hhf * lw * v2 + lh * hwf * v3 + lh * lw * v4);
+  return static_cast<scalar_t>(val);
 }
 
 template <typename scalar_t>
 __device__ scalar_t mdmcn_get_gradient_weight(scalar_t argmax_h, scalar_t argmax_w,
                                           const int h, const int w, const int height, const int width)
 {
-  if (argmax_h <= -1 || argmax_h >= height || argmax_w <= -1 || argmax_w >= width)
-  {
-    //empty
-    return 0;
-  }
+  float ah = _to_float(argmax_h);
+  float aw = _to_float(argmax_w);
+  if (ah <= -1.0f || ah >= static_cast<float>(height) || aw <= -1.0f || aw >= static_cast<float>(width))
+    return static_cast<scalar_t>(0);
 
-  int argmax_h_low = floor(argmax_h);
-  int argmax_w_low = floor(argmax_w);
+  int argmax_h_low = (int)floorf(ah);
+  int argmax_w_low = (int)floorf(aw);
   int argmax_h_high = argmax_h_low + 1;
   int argmax_w_high = argmax_w_low + 1;
 
-  scalar_t weight = 0;
+  float weight = 0.0f;
   if (h == argmax_h_low && w == argmax_w_low)
-    weight = (h + 1 - argmax_h) * (w + 1 - argmax_w);
+    weight = (h + 1.0f - ah) * (w + 1.0f - aw);
   if (h == argmax_h_low && w == argmax_w_high)
-    weight = (h + 1 - argmax_h) * (argmax_w + 1 - w);
+    weight = (h + 1.0f - ah) * (aw + 1.0f - w);
   if (h == argmax_h_high && w == argmax_w_low)
-    weight = (argmax_h + 1 - h) * (w + 1 - argmax_w);
+    weight = (ah + 1.0f - h) * (w + 1.0f - aw);
   if (h == argmax_h_high && w == argmax_w_high)
-    weight = (argmax_h + 1 - h) * (argmax_w + 1 - w);
-  return weight;
+    weight = (ah + 1.0f - h) * (aw + 1.0f - w);
+  return static_cast<scalar_t>(weight);
 }
 
 template <typename scalar_t>
@@ -85,45 +123,107 @@ __device__ scalar_t mdmcn_get_coordinate_weight(scalar_t argmax_h, scalar_t argm
                                             const int height, const int width, const scalar_t *im_data,
                                             const int data_width, const int bp_dir)
 {
-  if (argmax_h <= -1 || argmax_h >= height || argmax_w <= -1 || argmax_w >= width)
-  {
-    //empty
-    return 0;
-  }
+  float ah = _to_float(argmax_h);
+  float aw = _to_float(argmax_w);
+  if (ah <= -1.0f || ah >= static_cast<float>(height) || aw <= -1.0f || aw >= static_cast<float>(width))
+    return static_cast<scalar_t>(0);
 
-  int argmax_h_low = floor(argmax_h);
-  int argmax_w_low = floor(argmax_w);
+  int argmax_h_low = (int)floorf(ah);
+  int argmax_w_low = (int)floorf(aw);
   int argmax_h_high = argmax_h_low + 1;
   int argmax_w_high = argmax_w_low + 1;
 
-  scalar_t weight = 0;
+  float weight = 0.0f;
 
   if (bp_dir == 0)
   {
-    if (argmax_h_low >= 0 && argmax_w_low >= 0)
-      weight += -1 * (argmax_w_low + 1 - argmax_w) * im_data[argmax_h_low * data_width + argmax_w_low];
-    if (argmax_h_low >= 0 && argmax_w_high <= width - 1)
-      weight += -1 * (argmax_w - argmax_w_low) * im_data[argmax_h_low * data_width + argmax_w_high];
-    if (argmax_h_high <= height - 1 && argmax_w_low >= 0)
-      weight += (argmax_w_low + 1 - argmax_w) * im_data[argmax_h_high * data_width + argmax_w_low];
-    if (argmax_h_high <= height - 1 && argmax_w_high <= width - 1)
-      weight += (argmax_w - argmax_w_low) * im_data[argmax_h_high * data_width + argmax_w_high];
+    float v11 = _bilinear_fetch(im_data, data_width, argmax_h_low, argmax_w_low, height, width);
+    float v12 = _bilinear_fetch(im_data, data_width, argmax_h_low, argmax_w_high, height, width);
+    float v21 = _bilinear_fetch(im_data, data_width, argmax_h_high, argmax_w_low, height, width);
+    float v22 = _bilinear_fetch(im_data, data_width, argmax_h_high, argmax_w_high, height, width);
+
+    weight += -1.0f * (argmax_w_low + 1.0f - aw) * v11;
+    weight += -1.0f * (aw - argmax_w_low) * v12;
+    weight += (argmax_w_low + 1.0f - aw) * v21;
+    weight += (aw - argmax_w_low) * v22;
   }
   else if (bp_dir == 1)
   {
-    if (argmax_h_low >= 0 && argmax_w_low >= 0)
-      weight += -1 * (argmax_h_low + 1 - argmax_h) * im_data[argmax_h_low * data_width + argmax_w_low];
-    if (argmax_h_low >= 0 && argmax_w_high <= width - 1)
-      weight += (argmax_h_low + 1 - argmax_h) * im_data[argmax_h_low * data_width + argmax_w_high];
-    if (argmax_h_high <= height - 1 && argmax_w_low >= 0)
-      weight += -1 * (argmax_h - argmax_h_low) * im_data[argmax_h_high * data_width + argmax_w_low];
-    if (argmax_h_high <= height - 1 && argmax_w_high <= width - 1)
-      weight += (argmax_h - argmax_h_low) * im_data[argmax_h_high * data_width + argmax_w_high];
+    float v11 = _bilinear_fetch(im_data, data_width, argmax_h_low, argmax_w_low, height, width);
+    float v12 = _bilinear_fetch(im_data, data_width, argmax_h_low, argmax_w_high, height, width);
+    float v21 = _bilinear_fetch(im_data, data_width, argmax_h_high, argmax_w_low, height, width);
+    float v22 = _bilinear_fetch(im_data, data_width, argmax_h_high, argmax_w_high, height, width);
+
+    weight += -1.0f * (argmax_h_low + 1.0f - ah) * v11;
+    weight += (argmax_h_low + 1.0f - ah) * v12;
+    weight += -1.0f * (ah - argmax_h_low) * v21;
+    weight += (ah - argmax_h_low) * v22;
   }
 
-  return weight;
+  return static_cast<scalar_t>(weight);
 }
 
+// ---------------------------------------------------------------------------
+// Half atomics via CAS — forward declarations (no arch guard: needed for
+// host compilation phase of `if constexpr` branches).
+// ---------------------------------------------------------------------------
+template <typename T>
+__device__ __forceinline__ void _dcn_atomic_add_half(T *addr, T val);
+template <typename T>
+__device__ __forceinline__ void _dcn_atomic_add_bf16(T *addr, T val);
+
+// ---------------------------------------------------------------------------
+// Half atomics via CAS — definitions (guarded by arch for SM requirements)
+// ---------------------------------------------------------------------------
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+template <typename T>
+__device__ __forceinline__ void _dcn_atomic_add_half(T *addr, T val) {
+  unsigned int *addr_as_ui = (unsigned int *)((char *)addr - ((size_t)addr & 2));
+  unsigned int old = *addr_as_ui;
+  unsigned int assumed;
+  do {
+    assumed = old;
+    unsigned short old_h = (old >> (((size_t)addr & 2) * 8U)) & 0xffff;
+    __half h_old;
+    memcpy(&h_old, &old_h, sizeof(__half));
+    __half h_val;
+    memcpy(&h_val, &val, sizeof(__half));
+    __half h_new = __hadd(h_old, h_val);
+    unsigned short new_h;
+    memcpy(&new_h, &h_new, sizeof(unsigned short));
+    old = (old & ~(0xffffU << (((size_t)addr & 2) * 8U))) |
+          ((unsigned int)new_h << (((size_t)addr & 2) * 8U));
+    old = atomicCAS(addr_as_ui, assumed, old);
+  } while (assumed != old);
+}
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template <typename T>
+__device__ __forceinline__ void _dcn_atomic_add_bf16(T *addr, T val) {
+  unsigned int *addr_as_ui = (unsigned int *)((char *)addr - ((size_t)addr & 2));
+  unsigned int old = *addr_as_ui;
+  unsigned int assumed;
+  do {
+    assumed = old;
+    unsigned short old_h = (old >> (((size_t)addr & 2) * 8U)) & 0xffff;
+    __nv_bfloat16 h_old;
+    memcpy(&h_old, &old_h, sizeof(__nv_bfloat16));
+    __nv_bfloat16 h_val;
+    memcpy(&h_val, &val, sizeof(__nv_bfloat16));
+    __nv_bfloat16 h_new = __hadd(h_old, h_val);
+    unsigned short new_h;
+    memcpy(&new_h, &h_new, sizeof(unsigned short));
+    old = (old & ~(0xffffU << (((size_t)addr & 2) * 8U))) |
+          ((unsigned int)new_h << (((size_t)addr & 2) * 8U));
+    old = atomicCAS(addr_as_ui, assumed, old);
+  } while (assumed != old);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Forward kernel: modulated_deformable_im2col
+// ---------------------------------------------------------------------------
 template <typename scalar_t>
 __global__ void modulated_deformable_im2col_gpu_kernel(const int n,
                                                        const scalar_t *data_im, const scalar_t *data_offset, const scalar_t *data_mask,
@@ -177,14 +277,16 @@ __global__ void modulated_deformable_im2col_gpu_kernel(const int n,
         scalar_t val = static_cast<scalar_t>(0);
         const scalar_t h_im = h_in + i * dilation_h + offset_h;
         const scalar_t w_im = w_in + j * dilation_w + offset_w;
-        if (h_im > -1 && w_im > -1 && h_im < height && w_im < width)
+        float h_im_f = _to_float(h_im);
+        float w_im_f = _to_float(w_im);
+        if (h_im_f > -1.0f && w_im_f > -1.0f && h_im_f < static_cast<float>(height) && w_im_f < static_cast<float>(width))
         {
           //const scalar_t map_h = i * dilation_h + offset_h;
           //const scalar_t map_w = j * dilation_w + offset_w;
           //const int cur_height = height - h_in;
           //const int cur_width = width - w_in;
           //val = dmcn_im2col_bilinear(data_im_ptr, width, cur_height, cur_width, map_h, map_w);
-          val = mdmcn_im2col_bilinear(data_im_ptr, width, height, width, h_im, w_im);
+          val = dmcn_im2col_bilinear(data_im_ptr, width, height, width, h_im, w_im);
         }
         *data_col_ptr = val * mask;
         data_col_ptr += batch_size * height_col * width_col;
@@ -233,20 +335,26 @@ __global__ void modulated_deformable_col2im_gpu_kernel(const int n,
     const scalar_t cur_inv_w_data = w_in + j * dilation_w + offset_w;
 
     const scalar_t cur_top_grad = data_col[index] * mask;
-    const int cur_h = (int)cur_inv_h_data;
-    const int cur_w = (int)cur_inv_w_data;
+    const int cur_h = (int)_to_float(cur_inv_h_data);
+    const int cur_w = (int)_to_float(cur_inv_w_data);
+    float inv_h = _to_float(cur_inv_h_data);
+    float inv_w = _to_float(cur_inv_w_data);
     for (int dy = -2; dy <= 2; dy++)
     {
       for (int dx = -2; dx <= 2; dx++)
       {
         if (cur_h + dy >= 0 && cur_h + dy < height &&
             cur_w + dx >= 0 && cur_w + dx < width &&
-            abs(cur_inv_h_data - (cur_h + dy)) < 1 &&
-            abs(cur_inv_w_data - (cur_w + dx)) < 1)
+            fabs(inv_h - static_cast<float>(cur_h + dy)) < 1.0f &&
+            fabs(inv_w - static_cast<float>(cur_w + dx)) < 1.0f)
         {
           int cur_bottom_grad_pos = ((b * channels + c) * height + cur_h + dy) * width + cur_w + dx;
           scalar_t weight = mdmcn_get_gradient_weight(cur_inv_h_data, cur_inv_w_data, cur_h + dy, cur_w + dx, height, width);
-          atomicAdd(grad_im + cur_bottom_grad_pos, weight * cur_top_grad);
+          if constexpr (sizeof(scalar_t) == 2) {
+            _dcn_atomic_add_half<scalar_t>(grad_im + cur_bottom_grad_pos, weight * cur_top_grad);
+          } else {
+            atomicAdd(grad_im + cur_bottom_grad_pos, weight * cur_top_grad);
+          }
         }
       }
     }
@@ -269,7 +377,7 @@ __global__ void modulated_deformable_col2im_coord_gpu_kernel(const int n,
 {
   CUDA_KERNEL_LOOP(index, n)
   {
-    scalar_t val = 0, mval = 0;
+    float val = 0.0f, mval = 0.0f;
     int w = index % width_col;
     int h = (index / width_col) % height_col;
     int c = (index / width_col / height_col) % offset_channels;
@@ -303,30 +411,39 @@ __global__ void modulated_deformable_col2im_coord_gpu_kernel(const int n,
       const scalar_t offset_h = data_offset_ptr[data_offset_h_ptr];
       const scalar_t offset_w = data_offset_ptr[data_offset_w_ptr];
       const scalar_t mask = data_mask_ptr[data_mask_hw_ptr];
-      scalar_t inv_h = h_in + i * dilation_h + offset_h;
-      scalar_t inv_w = w_in + j * dilation_w + offset_w;
-      if (inv_h <= -1 || inv_w <= -1 || inv_h >= height || inv_w >= width)
+      float inv_h = static_cast<float>(h_in + i * dilation_h) + _to_float(offset_h);
+      float inv_w = static_cast<float>(w_in + j * dilation_w) + _to_float(offset_w);
+      if (inv_h <= -1.0f || inv_w <= -1.0f || inv_h >= static_cast<float>(height) || inv_w >= static_cast<float>(width))
       {
-        inv_h = inv_w = -2;
+        inv_h = -2.0f;
+        inv_w = -2.0f;
       }
       else
       {
-        mval += data_col_ptr[col_pos] * mdmcn_im2col_bilinear(data_im_ptr + cnt * height * width, width, height, width, inv_h, inv_w);
+        const scalar_t *im_slice = data_im_ptr + cnt * height * width;
+        mval += _to_float(data_col_ptr[col_pos]) * _to_float(
+          dmcn_im2col_bilinear(im_slice, width, height, width,
+                               static_cast<scalar_t>(inv_h), static_cast<scalar_t>(inv_w)));
       }
       const scalar_t weight = mdmcn_get_coordinate_weight(
-          inv_h, inv_w,
+          static_cast<scalar_t>(inv_h), static_cast<scalar_t>(inv_w),
           height, width, data_im_ptr + cnt * height * width, width, bp_dir);
-      val += weight * data_col_ptr[col_pos] * mask;
+      val += _to_float(weight) * _to_float(data_col_ptr[col_pos]) * _to_float(mask);
       cnt += 1;
     }
     // KERNEL_ASSIGN(grad_offset[index], offset_req, val);
-    grad_offset[index] = val;
+    grad_offset[index] = static_cast<scalar_t>(val);
     if (offset_c % 2 == 0)
+    {
       // KERNEL_ASSIGN(grad_mask[(((b * deformable_group + deformable_group_index) * kernel_h * kernel_w + offset_c / 2) * height_col + h) * width_col + w], mask_req, mval);
-      grad_mask[(((b * deformable_group + deformable_group_index) * kernel_h * kernel_w + offset_c / 2) * height_col + h) * width_col + w] = mval;
+      grad_mask[(((b * deformable_group + deformable_group_index) * kernel_h * kernel_w + offset_c / 2) * height_col + h) * width_col + w] = static_cast<scalar_t>(mval);
+    }
   }
 }
 
+// ---------------------------------------------------------------------------
+// Host-callable wrappers
+// ---------------------------------------------------------------------------
 template <typename scalar_t>
 void modulated_deformable_im2col_cuda(cudaStream_t stream,
   const scalar_t* data_im, const scalar_t* data_offset, const scalar_t* data_mask,

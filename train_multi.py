@@ -1,12 +1,29 @@
 import time
 import datetime
 
-import numpy as np
-from argparse import ArgumentParser
-
+import sys
 import os
 
+# ------------------------------------------------------------
+# Must set CUDA_VISIBLE_DEVICES before any torch import to
+# prevent PyTorch from occupying other GPUs.
+# Parse --gpu from sys.argv manually to extract GPU indices.
+# ------------------------------------------------------------
+gpu_custom = "0"
+for i, arg in enumerate(sys.argv):
+    if arg == "--gpu" and i + 1 < len(sys.argv):
+        gpu_custom = sys.argv[i + 1]
+        break
+if "," in gpu_custom or " " in gpu_custom:
+    gpu_custom = gpu_custom.replace(" ", ",")
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_custom
+elif gpu_custom:
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_custom
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+from argparse import ArgumentParser
 
 import torch
 import torch.nn as nn
@@ -15,14 +32,11 @@ import torch.utils.data as Data
 from tensorboardX import SummaryWriter
 
 from model.FeedbackSTS import FeedbackSTS
-#from utils.dataset import TrainSetIRSatVideoLoader, MIRSDTLoader
 from utils.dataset import IRSatVideoLoader, MIRSDTLoader
 from utils.loss import SoftIoULoss
 from utils.logger import setup_logger
 from utils.utils import get_optimizer, train_save_dir_settings, save_checkpoint
 
-
-# from torch.cuda.amp import autocast, GradScaler
 
 def parse_args():
     #
@@ -48,8 +62,8 @@ def parse_args():
     parser.add_argument("--precision", type=str, default='32F', help="Training Precision. 16F, 32F")
     parser.add_argument('--epochs', type=int, default=20, help='number of epochs')
     parser.add_argument("--patchSize", type=int, default=256, help="Training patch size")
-    parser.add_argument('--gpu', type=str, default='0',  #nargs='+',
-                        help="GPU number: '0 2 3'")
+    parser.add_argument('--gpu', type=str, default='0',
+                        help="GPU number(s): single GPU like '3', multi GPU like '1,3,5' or '1 3 5'")
     parser.add_argument('--seed', type=int, default=42, help='seed: 0, 42, 1307等')
     parser.add_argument("--optimizer_name", default='Adam', type=str, help="optimizer name: Adam, Adagrad, SGD")
     parser.add_argument("--optimizer_settings", default={'lr': 5e-4}, type=dict, help="optimizer settings")
@@ -80,14 +94,12 @@ def set_seeds(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # torch.backends.cudnn.deterministic = True
 
 
 def names_standard_format(original_names):
     if (isinstance(original_names, list)):
         if (len(original_names) == 1):
             names = original_names[0].split(',') if ',' in original_names[0] else original_names[0].split()
-            # print(names)
         else:
             names = original_names
     elif (original_names == None):
@@ -107,9 +119,6 @@ class Trainer(object):
 
         ## dataset
         if args.dataset_name == 'IRSatVideo-LEO':
-            # self.train_set = TrainSetIRSatVideoLoader(dataset_dir = args.dataset_dir, 
-            #             dataset_name = args.dataset_name, seq_len = args.seq_len,
-            #             patch_size = args.patchSize, sample_rate = args.sample_rate)
             self.train_set = IRSatVideoLoader(dataset_dir=args.dataset_dir,
                                               dataset_name=args.dataset_name, seq_len=args.seq_len,
                                               sample_space=args.sample_space, patch_size=args.patchSize)
@@ -125,32 +134,38 @@ class Trainer(object):
         self.iter_per_epoch = len(self.train_loader)
         self.max_iter = args.epochs * self.iter_per_epoch
 
-        # GPU
-        gpu_list = names_standard_format(args.gpu)
-        # print(len(gpu_list))
-        # print(gpu_list)
-        if torch.cuda.is_available():
-            if((len(gpu_list) > 1) and torch.cuda.device_count() > 1):
-                gpu_devices = ",".join(gpu_list)
-                print(gpu_devices)
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_devices
-            else:
-                torch.cuda.set_device(int(gpu_list[0]))
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # if torch.cuda.is_available():
-        #     torch.cuda.set_device(int(args.gpu))
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         ## model
         self.net = FeedbackSTS()
-        if((len(gpu_list) > 1) and torch.cuda.device_count() > 1):
-            self.net = nn.DataParallel(self.net, device_ids=[0, 1, 2, 3, 4, 5, 6, 7])
+
+        # ------------------------------------------------------------
+        # GPU setup: support single & multiple GPUs
+        # ------------------------------------------------------------
+        gpu_list = names_standard_format(args.gpu)
+        gpu_ids = [int(g) for g in gpu_list]
+
+        if torch.cuda.is_available():
+            if len(gpu_ids) > 1:
+                # Multi-GPU: CUDA_VISIBLE_DEVICES already set at top of file,
+                # GPUs are now seen as 0, 1, 2...
+                self.device = torch.device("cuda:0")
+                self.net = nn.DataParallel(self.net, device_ids=list(range(len(gpu_ids))))
+            else:
+                # Single GPU
+                torch.cuda.set_device(gpu_ids[0])
+                self.device = torch.device("cuda:{}".format(gpu_ids[0]))
+        else:
+            self.device = torch.device("cpu")
 
         self.net = self.net.to(self.device)
 
-        if self.args.precision == "16F":
-            self.net.half()
+        # ------------------------------------------------------------
+        # Half-precision initialization (AMP)
+        # ------------------------------------------------------------
+        self.amp_enabled = (self.args.precision == "16F")
+        if self.amp_enabled:
+            self.scaler = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler = None
 
         ## criterion
         self.cal_loss = SoftIoULoss()
@@ -171,7 +186,6 @@ class Trainer(object):
         self.logger.info(self.model_name + " + " + args.dataset_name)
 
     def training(self):
-        #epoch_state = 0
         total_loss_list = []
         total_loss_epoch = []
 
@@ -186,24 +200,33 @@ class Trainer(object):
                 img = img.to(self.device)
                 gt_mask = gt_mask.to(self.device)
 
-                if self.args.precision == "16F":
-                    img = img.half()
-                    gt_mask = gt_mask.half()
-
-                if img.shape[0] == 1:  # batch size 为 1 又有什么影响?
+                if img.shape[0] == 1:
                     continue
 
-                pred = self.net(img)
+                # ------------------------------------------------------------
+                # Forward pass with optional AMP autocast
+                # ------------------------------------------------------------
+                if self.amp_enabled:
+                    with torch.amp.autocast('cuda', dtype=torch.float16):
+                        pred = self.net(img)
+                        loss = self.cal_loss(pred, gt_mask)
+                else:
+                    pred = self.net(img)
+                    loss = self.cal_loss(pred, gt_mask)
 
-                if self.args.precision:
-                    pred = pred.float()
-
-                loss = self.cal_loss(pred, gt_mask)
                 total_loss_epoch.append(loss.detach().cpu())
 
+                # ------------------------------------------------------------
+                # Backward pass with optional gradient scaling
+                # ------------------------------------------------------------
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                if self.amp_enabled:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
 
                 self.iter_num += 1
 
@@ -220,9 +243,13 @@ class Trainer(object):
                                         self.iter_per_epoch, self.optimizer.state_dict()['param_groups'][0]['lr'],
                                         loss.item(), cost_string, eta_string))
 
+                    # Flush logger to ensure output in tmux
+                    for handler in self.logger.handlers:
+                        handler.flush()
+
             self.scheduler.step()
 
-            if (idx_epoch + 1) % self.args.log_per_epoch == 0:  # 该代码没有任何过滤作用，只要是非负整数，就能触发
+            if (idx_epoch + 1) % self.args.log_per_epoch == 0:
                 total_loss_list.append(float(np.array(total_loss_epoch).mean()))
                 self.logger.info(time.ctime()[4:-5] + ' Epoch---%d, lr---%f, total_loss---%f' % (idx_epoch + 1,
                                                                                                  self.optimizer.state_dict()[
@@ -230,20 +257,17 @@ class Trainer(object):
                                                                                                      'lr'],
                                                                                                  total_loss_list[-1]))
                 total_loss_epoch = []
+                # Flush logger after epoch log
+                for handler in self.logger.handlers:
+                    handler.flush()
 
             if (idx_epoch + 1) % self.args.save_iter_step == 0:
-                # if (idx_epoch + 1) % 1 == 0:
                 save_pth = self.args.dataset_save_dir \
                            + self.model_name + '_' \
                            + "SeqLen{:02d}".format(self.args.seq_len) + '_' \
                            + "{:02d}".format(idx_epoch + 1) + '.pth.tar'
 
                 torch.save(self.net.state_dict(), save_pth)
-                # save_checkpoint({
-                #     'epoch': idx_epoch + 1,
-                #     'state_dict': self.net.state_dict(),
-                #     'total_loss': total_loss_list,
-                #     }, save_pth)
 
             if (idx_epoch + 1) == self.args.epochs and (idx_epoch + 1) % 5 != 0:
                 save_pth = self.args.dataset_save_dir \

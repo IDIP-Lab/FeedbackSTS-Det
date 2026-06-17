@@ -70,6 +70,19 @@ python train.py \
   --patchSize 256 \
   --gpu 2   # Use GPU 2
 ```
+* **Half-Precision (FP16) Training Support**
+To enable half-precision training, add the `--precision 16F` flag when running the training script. This also works for multi-GPU training. Example:
+```bash
+python train.py \
+  --dataset_dir <PATH_TO_YOUR_DATASET_DIRECTORY> \
+  --dataset_names IRSatVideo-LEO \
+  --seq_len 5 \
+  --sample_space 3 \
+  --batchSize 6 \
+  --patchSize 256 \
+  --precision 16F   # Half-precision training
+```
+
 #### Multiple GPU Training
 Multi-GPU training follows the same procedure as single-GPU training. Simply replace `train.py` with `train_multi.py` and specify multiple GPU IDs in the `--gpu` argument. The specific example is shown below:
 ```bash
@@ -81,7 +94,7 @@ python train_multi.py \
   --sample_space 3 \
   --batchSize 16 \
   --patchSize 256 \
-  --gpu 0,1,2,3,4,5 # Specify multiple GPUs
+  --gpu 2,3,4,5 # Specify multiple GPUs
 ```
 
 ### Commands for Testing
@@ -137,3 +150,9 @@ python evaluate.py \
       url={https://arxiv.org/abs/2601.14690},
 }
 ```
+
+## Contact
+
+If you have any questions, please feel free to contact the authors.
+
+Yian Huang: [huangyian1@std.uestc.edu.cn](mailto:huangyian1@std.uestc.edu.cn)

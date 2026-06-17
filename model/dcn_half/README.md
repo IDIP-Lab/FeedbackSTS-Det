@@ -1,7 +1,12 @@
 # Deformable-ConvNets-V2 in PyTorch
 
 This repo is an implementation of [Deformable Convolution V2](https://arxiv.org/abs/1811.11168).
+
+⚡ **Half-Precision (FP16) Support** — This version has been adapted to work with PyTorch's AMP (`torch.amp.autocast` + `GradScaler`) for mixed-precision training. All CUDA kernels use C API functions (`__half2float`, etc.) instead of C++ half operators/conversions, bypassing the `-D__CUDA_NO_HALF_*` macros that PyTorch automatically adds during CUDA extension builds. Compatible with CUDA 11.8+ and PyTorch 1.x / 2.x. The adpted version could refer to [dcn_half](https://github.com/IDIP-Lab/dcn_half). 
+
 Ported from the original [MXNet implementation](https://github.com/msracver/Deformable-ConvNets/tree/master/DCNv2_op).
+
+
 
 Refer to [mmdetection branch](https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/tree/mmdetection) in this repo for a complete framework. Results of DCNv2 based on mmdetection code base can be found at [model zoo](https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/blob/mmdetection/MODEL_ZOO.md#deformable-conv-v2). Many thanks to [mmdetection](https://github.com/open-mmlab/mmdetection) for their strong and clean framework.
 
@@ -12,6 +17,8 @@ sh make.sh
 ```
 
 See `test.py` and `test_modulated.py` for example usage.
+
+> ⚡ **Half-Precision (FP16) Support** — This version has been adapted to work with PyTorch's AMP (`torch.amp.autocast` + `GradScaler`) for mixed-precision training. All CUDA kernels use C API functions (`__half2float`, etc.) instead of C++ half operators/conversions, bypassing the `-D__CUDA_NO_HALF_*` macros that PyTorch automatically adds during CUDA extension builds. Compatible with CUDA 11.8+ and PyTorch 1.x / 2.x.
 
 ## Notice
 
@@ -32,7 +39,7 @@ This repo provides the deformable conv layer which can reproduce the results in 
           step 1 (slicing): slicing the input data at the batch dimension from i*S to (i+1)*S, input (NxCxHxW) -> sliced input (SxCxHxW)
           step 2 (deformable im2col): sliced input (SxCxHxW)+sliced offset (Sx18xHxW) -> column (Cx9xSxHxW)
           step 3 (MatMul&reshape): weight matrix (C'x 9C) * column (9CxSHW) -> temp sliced output (C'xSxHxW) -> sliced output (SxC'xHxW)
-          step 4 (Merge): merge sliced output to form the whole output data (NxC'xHxW) 
+          step 4 (Merge): merge sliced output to form the whole output data (NxC'xHxW)
       end
 
-    In the previous operator, S is fixed as 1. In the updated operator, S can be set by the *im2col_step* parameter, whose default value is min(N, 64). The updated operator is significantly faster than the existing one when the image batch size is large.
+    In the previous operator, S is fixed as 1. In the updated operator, S can be set by the *im2col_step* parameter, whose default value is min(N, 64). The updated operator is significantly faster than the existing one when the image batch (base)

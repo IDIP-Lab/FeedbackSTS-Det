@@ -1,9 +1,16 @@
 import torch.nn as nn
+import torch
 
 class SoftIoULoss(nn.Module):
     def __init__(self):
         super(SoftIoULoss, self).__init__()
     def forward(self, preds, gt_masks):
+        # Cast to float32 for stable loss computation
+        if preds.dtype != torch.float32:
+            preds = preds.float()
+        if gt_masks.dtype != torch.float32:
+            gt_masks = gt_masks.float()
+
         if isinstance(preds, list) or isinstance(preds, tuple):
             loss_total = 0
             for i in range(len(preds)):

@@ -8,8 +8,6 @@ import torch
 from torch import nn
 from torch.autograd import Function
 from torch.nn.modules.utils import _pair
-from torch.autograd.function import once_differentiable
-
 import DCN2 as DCN
 
 class DeformRoIPoolingFunction(Function):
@@ -33,7 +31,7 @@ class DeformRoIPoolingFunction(Function):
         ctx.trans_std = trans_std
 
         output, output_count = \
-            DCN.deform_psroi_pooling_forward(input, rois, offset,
+            DCN.deform_psroi_pooling_forward(input.contiguous(), rois.contiguous(), offset.contiguous(),
                                                   ctx.no_trans, ctx.spatial_scale,
                                                   ctx.output_dim, ctx.group_size,
                                                   ctx.pooled_size, ctx.part_size,
@@ -42,7 +40,6 @@ class DeformRoIPoolingFunction(Function):
         return output
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
         input, rois, offset, output_count = ctx.saved_tensors
         grad_input, grad_offset = \

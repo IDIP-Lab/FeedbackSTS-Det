@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .dcn.modules.deform_conv import DeformConv
+#from .dcn.modules.deform_conv import DeformConv
+from .dcn_half.modules.deform_conv import DeformConv
 
 class BFBM(nn.Module):
     """
