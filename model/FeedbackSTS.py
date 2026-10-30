@@ -5,6 +5,9 @@ import torch.nn.functional as F
 #from .dcn.modules.deform_conv import DeformConv
 from .dcn_half.modules.deform_conv import DeformConv
 
+DEFAULT_SEQUENCE_LENGTH = 11
+DEFAULT_SPARSE_INTERVAL = 2
+
 class BFBM(nn.Module):
     """
     Basic Feedback Module (BFBM)
@@ -19,10 +22,23 @@ class BFBM(nn.Module):
         self.level_num = level_num
 
         # ---- Feature Extraction (Fig. b) ----
-        self.downsample_convs = nn.ModuleList()
+        # MyNet16 computes separate pyramids for the neighbor and reference.
+        # Keep the FeedbackSTS class names, but preserve those exact weights.
+        self.conv_nbr_list = nn.ModuleList()
+        self.conv_ref_list = nn.ModuleList()
         for _ in range(level_num - 1):
-            self.downsample_convs.append(nn.Conv2d(num_feat, num_feat, 3, stride=2, padding=1))
-            self.downsample_convs.append(nn.Conv2d(num_feat, num_feat, 3, stride=1, padding=1))
+            self.conv_nbr_list.append(
+                nn.Conv2d(num_feat, num_feat, 3, stride=2, padding=1)
+            )
+            self.conv_nbr_list.append(
+                nn.Conv2d(num_feat, num_feat, 3, stride=1, padding=1)
+            )
+            self.conv_ref_list.append(
+                nn.Conv2d(num_feat, num_feat, 3, stride=2, padding=1)
+            )
+            self.conv_ref_list.append(
+                nn.Conv2d(num_feat, num_feat, 3, stride=1, padding=1)
+            )
 
         # ---- Feature Alignment (Fig. c) ----
         self.offset_conv1 = nn.ModuleDict()
@@ -47,9 +63,11 @@ class BFBM(nn.Module):
                 self.feat_conv[level] = nn.Conv2d(num_feat * 2, num_feat, 3, 1, 1)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.lrelu = nn.ReLU(inplace=True)
+        # DCN backward returns a view in PyTorch 2.x; in-place ReLU would
+        # overwrite it and invalidate the custom autograd function.
+        self.lrelu = nn.ReLU(inplace=False)
 
-    def feature_extraction(self, x):
+    def feature_extraction(self, x, convolutions):
         """
         Fig. 2(b): Generate a pyramid feature list, where index 0 is 
         the original size, and as the index increases, the size halves.
@@ -57,8 +75,8 @@ class BFBM(nn.Module):
         feat_list = [x]
         current = x
         for i in range(self.level_num - 1):
-            current = self.lrelu(self.downsample_convs[2*i](current))
-            current = self.lrelu(self.downsample_convs[2*i+1](current))
+            current = self.lrelu(convolutions[2 * i](current))
+            current = self.lrelu(convolutions[2 * i + 1](current))
             feat_list.append(current)
         return feat_list
 
@@ -99,8 +117,8 @@ class BFBM(nn.Module):
         Returns:
             aligned (Tensor): aligned frame features (B, C, H, W)
         """
-        nbr_feats = self.feature_extraction(neighbor)
-        ref_feats = self.feature_extraction(reference)
+        nbr_feats = self.feature_extraction(neighbor, self.conv_nbr_list)
+        ref_feats = self.feature_extraction(reference, self.conv_ref_list)
         aligned = self.feature_alignment(nbr_feats, ref_feats)
         return aligned
 
@@ -149,8 +167,12 @@ class SSM(nn.Module):
                 output_feats[indices[0]] = prop_feat
                 for i in range(1, len(indices)):
                     curr_feat = X[:, :, indices[i], :, :]
-                    # BFBM: neighbor = current frame, reference = propagated feature from the previous time step.
-                    prop_feat = self.bfbm(neighbor=curr_feat, reference=prop_feat)
+                    # MyNet16 aligns the propagated history feature to the
+                    # current feature. Preserve that direction exactly.
+                    prop_feat = self.bfbm(
+                        neighbor=prop_feat,
+                        reference=curr_feat,
+                    )
                     output_feats[indices[i]] = prop_feat
             else:
                 # Backward direction: starting from the last frame within the group.
@@ -158,7 +180,10 @@ class SSM(nn.Module):
                 output_feats[indices[-1]] = prop_feat
                 for i in range(len(indices)-2, -1, -1):
                     curr_feat = X[:, :, indices[i], :, :]
-                    prop_feat = self.bfbm(neighbor=curr_feat, reference=prop_feat)
+                    prop_feat = self.bfbm(
+                        neighbor=prop_feat,
+                        reference=curr_feat,
+                    )
                     output_feats[indices[i]] = prop_feat
 
         # 3. Temporal Reassembly: stack in the original order
@@ -231,13 +256,28 @@ class FeedbackSTS(nn.Module):
                  outch=1,
                  feat_channels=[8, 16, 32, 64, 128],
                  ssm_level_nums=[2, 2, 2, 2, 2],
-                 t_s=[2, 2, 2, 2, 2],
+                 t_s=None,
                  down_using_ssm=[True, True, True, True, True],
                  up_using_ssm=[True, True, True, True],
                  down_is_forward=[True, True, True, True, True],
                  up_is_forward=[False, False, False, False]
                  ):
         super(FeedbackSTS, self).__init__()
+
+        # Paper configuration: sequence length 11 and sparse-frame interval
+        # T=2 at every encoder/decoder level. Keep it explicit so training,
+        # testing, and checkpoint evaluation cannot silently disagree.
+        if t_s is None:
+            t_s = [DEFAULT_SPARSE_INTERVAL] * len(feat_channels)
+        elif isinstance(t_s, int):
+            t_s = [t_s] * len(feat_channels)
+        if len(t_s) != len(feat_channels):
+            raise ValueError(
+                f"t_s must contain {len(feat_channels)} values, got {len(t_s)}"
+            )
+        if any(int(t) < 1 for t in t_s):
+            raise ValueError(f"Every sparse-frame interval must be >= 1, got {t_s}")
+        self.t_s = tuple(int(t) for t in t_s)
 
         # Encoder part: each stage consists of STSRM followed by MaxPool3d (the last stage has no pooling).
         self.enc_convs = nn.ModuleList()
